@@ -19,15 +19,16 @@ function S3Zipper(awsConfig) {
             secretAccessKey: awsConfig.secretAccessKey,
             sessionToken: awsConfig.sessionToken,
             region: awsConfig.region
-        }); } 
-    else {
+        }); 
+    } else {
         AWS.config.update({
             accessKeyId: awsConfig.accessKeyId,
             secretAccessKey: awsConfig.secretAccessKey,
             region: awsConfig.region
-    }
+        });
 
-    self.init(awsConfig);
+        self.init(awsConfig);
+    }
 }
 
 S3Zipper.prototype = {
@@ -521,7 +522,47 @@ S3Zipper.prototype = {
             });
         }
 
-        recursiveLoop(params.startKey, params.zipFileName, function () {
+        function recursiveLoopV2(startKey, fragFileName, callback) {
+            var fileStream = fs.createWriteStream(fragFileName);
+            t.streamZipMissingFilesTo({
+                pipe : fileStream
+                , folderName: params.s3FolderName
+                , startKey:startKey
+                , maxFileCount:params.maxFileCount
+                , maxFileSize:params.maxFileSize
+                , recursive: params.recursive }, function (err, result) {
+
+                if (err)
+                    report.errors.push(err);
+                else {
+                    if (result.zippedFiles.length > 0) {
+                        report.results.push(result);
+                        report.lastKey = result.zippedFiles[result.zippedFiles.length - 1].Key;
+                    }
+
+
+                    /// you may have not zipped anything but you scanned files and there may be more
+                    if (result.totalFilesScanned > 0)
+                        recursiveLoopV2(result.lastScannedFile.Key, params.zipFileName.replace(".zip", "_" + counter + ".zip"), callback);
+                    else ///you're done time to go home
+                        callback(err, result);
+
+                    counter++;
+                    /// clean up your trash you filthy animal
+                    garbageCollector(fileStream, result, fragFileName);
+
+                }
+
+            });
+        }
+
+        let invokeRecursiveFunction = recursiveLoop;
+
+        if (params.startKey && params.considerFilesSorting) {
+            invokeRecursiveFunction = recursiveLoopV2;
+        }
+
+        invokeRecursiveFunction(params.startKey, params.zipFileName, function () {
 
             if (report.errors.length > 0)
                 callback(report.errors, report.results);
@@ -533,6 +574,141 @@ S3Zipper.prototype = {
         return events;
 
     }
+
+      /*
+     params: {
+        pipe : pipe stream
+         , folderName: folder name to zip
+         , startKey: the key of the file you want to start after. keep null if you want to start from the first file
+         , maxFileCount: an integer that caps off how many files to zip at a time
+         , maxFileSize: max total size of files before they are zipped
+         , recursive: option to loop through nested folders
+       }
+       , callback : function
+    */
+    , streamZipMissingFilesTo: function (params, callback) {
+        if (!params || !params.folderName) {
+            console.error('folderName required');
+            return null;
+        }
+
+
+        const zip = new archiver.create('zip');
+        if (params.pipe) zip.pipe(params.pipe);
+
+        const t = this;
+
+        function loadAllFolderFiles (startKey, files = [],  callback){
+            t.getFiles({ 
+                folderName: params.folderName, 
+                startKey: startKey,
+                recursive: params.recursive 
+            }, function (err, result) {
+                if (err) {
+                    console.error(err);
+                    callback(err, files);
+                    return;
+                }
+
+                if (result.files.length > 0) {
+                    files = files.concat(result.files);
+                }
+
+                if (result.totalFilesScanned > 0) {
+                    loadAllFolderFiles(result.lastScannedFile.Key, files, callback);
+                    return;
+                } 
+
+                callback(null, files);
+                
+            });
+        }
+
+
+        loadAllFolderFiles(null, [], function(err, files) {
+            if (err) {
+                callback(err, null);
+            }
+
+            // Sort by last modified date
+            files.sort(function(a, b) {
+                return new Date(a.LastModified) - new Date(b.LastModified);
+            });
+
+            // Get all fiels after requested startKey
+            const startKeyIndex = files.findIndex((elem) => elem.Key === params.startKey);
+
+            let filesToZip = files.slice(startKeyIndex);
+
+            if (filesToZip.length === 1 && filesToZip[0].Key === params.startKey) {
+                filesToZip = [];
+            }
+
+            const result = [];
+            let totalSizeOfPassedFiles = 0;
+            let lastScannedFile;
+
+            for (const passedFile of filesToZip) {
+                if (params.maxFileSize && params.maxFileSize < passedFile.Size) {
+                    console.warn('Single file size exceeds max allowed size', passedFile.Size, '>', params.maxFileSize, passedFile);
+                    if (result.length == 0) {
+                        console.warn('Will zip large file on its own', passedFile.Key);
+                        result.push(passedFile);
+                        totalSizeOfPassedFiles += passedFile.Size;
+                    } else {
+                        break;
+                    }
+
+                } else if (params.maxFileSize && totalSizeOfPassedFiles + passedFile.Size > params.maxFileSize) {
+                    console.log('Hit max size limit. Split fragment');
+                    break;
+                } else {
+                    result.push(passedFile);
+                    totalSizeOfPassedFiles += passedFile.Size;
+                }
+
+                lastScannedFile = passedFile;
+            }
+
+            async.map(result, function (f, callback) {
+                t.s3bucket.getObject({Bucket: t.awsConfig.bucket, Key: f.Key}, function (err, data) {
+                    if (err)
+                        callback(err);
+                    else {
+
+                        var name = t.calculateFileName(f);
+
+                        if (name === ""){
+                            callback(null, f);
+                            return;
+                        }
+                        else {
+                            console.log('zipping ', name, '...');
+
+                            zip.append(data.Body, {name: name});
+                            callback(null, f);
+                        }
+
+                    }
+
+                });
+
+            }, function (err, results) {
+                zip.manifest = results;
+                zip.on('finish',function(){
+                    callback(err, {
+                        zip: zip,
+                        zippedFiles: results,
+                        totalFilesScanned: filesToZip.length,
+                        lastScannedFile: lastScannedFile
+                    });
+                });
+                zip.finalize();
+            });
+
+        });
+    }
+
 };
 
 module.exports = S3Zipper;
