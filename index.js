@@ -649,18 +649,20 @@ S3Zipper.prototype = {
             let lastScannedFile;
 
             for (const passedFile of filesToZip) {
-                if (params.maxFileSize && params.maxFileSize < passedFile.Size) {
+                if (params.maxFileSize && params.maxFileSize <= passedFile.Size) {
                     console.warn('Single file size exceeds max allowed size', passedFile.Size, '>', params.maxFileSize, passedFile);
                     if (result.length == 0) {
                         console.warn('Will zip large file on its own', passedFile.Key);
                         result.push(passedFile);
                         totalSizeOfPassedFiles += passedFile.Size;
                     } else {
+                        lastScannedFile = passedFile;
                         break;
                     }
 
-                } else if (params.maxFileSize && totalSizeOfPassedFiles + passedFile.Size > params.maxFileSize) {
+                } else if (params.maxFileSize && (totalSizeOfPassedFiles + passedFile.Size) > params.maxFileSize) {
                     console.log('Hit max size limit. Split fragment');
+                    lastScannedFile = passedFile;
                     break;
                 } else {
                     result.push(passedFile);
